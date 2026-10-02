@@ -1,0 +1,265 @@
+{
+  "name": "Research digest (arXiv → Claude → Slack)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "42885c05-6168-582a-9f53-34eeec778ad4",
+      "name": "Weekdays 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://export.arxiv.org/api/query",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search_query",
+              "value": "cat:cs.RO OR cat:cs.AI OR cat:q-fin.TR OR cat:cs.CV"
+            },
+            {
+              "name": "sortBy",
+              "value": "submittedDate"
+            },
+            {
+              "name": "sortOrder",
+              "value": "descending"
+            },
+            {
+              "name": "max_results",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "id": "6e721674-35ce-57a0-996a-02c5295ca418",
+      "name": "Fetch arXiv",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the arXiv Atom feed, drop papers already sent, pre-score by keywords.\nconst TOPICS = ['robot', 'manipulat', 'slam', 'lidar', 'event camera', 'neuromorphic', 'reinforcement',\n  'agent', 'language model', 'vision-language', 'trading', 'portfolio', 'spacecraft', 'uav', 'drone'];\nconst MAX_AGE_HOURS = 36;\nconst KEEP = 15;\n\nconst xml = $input.first().json.data || '';\nconst unescape = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&amp;/g, '&');\nconst tag = (block, name) => {\n  const m = block.match(new RegExp(`<${name}[^>]*>([\\\\s\\\\S]*?)</${name}>`));\n  return m ? unescape(m[1]).replace(/\\s+/g, ' ').trim() : '';\n};\n\nconst seen = $getWorkflowStaticData('global');\nseen.ids = seen.ids || [];\nconst now = Date.now();\nconst papers = [];\nfor (const block of xml.split('<entry>').slice(1)) {\n  const id = tag(block, 'id');\n  const published = tag(block, 'published');\n  const ageH = (now - Date.parse(published)) / 36e5;\n  if (!id || seen.ids.includes(id) || !(ageH <= MAX_AGE_HOURS)) continue;\n  const title = tag(block, 'title');\n  const summary = tag(block, 'summary');\n  const authors = [...block.matchAll(/<name>([\\s\\S]*?)<\\/name>/g)].map((m) => m[1].trim());\n  const text = `${title} ${summary}`.toLowerCase();\n  const keywordScore = TOPICS.filter((t) => text.includes(t)).length;\n  papers.push({ id, title, summary: summary.slice(0, 900), authors: authors.slice(0, 4), published, keywordScore });\n}\npapers.sort((a, b) => b.keywordScore - a.keywordScore);\nconst top = papers.slice(0, KEEP);\nseen.ids = [...seen.ids, ...top.map((p) => p.id)].slice(-2000);\nreturn top.map((p) => ({ json: p }));\n"
+      },
+      "id": "0621edb1-5f39-50bb-b3d4-455ac9e514c8",
+      "name": "Parse feed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- shared helpers (inlined by the builder; n8n Code nodes cannot import files) ----\nfunction claudeRequest(system, user, { model = 'claude-haiku-4-5-20251001', maxTokens = 1024 } = {}) {\n  // Body for POST https://api.anthropic.com/v1/messages\n  return { model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };\n}\n\nfunction claudeText(response) {\n  // Concatenate the text blocks of a Messages API response.\n  const blocks = (response && response.content) || [];\n  return blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');\n}\n\nfunction extractJson(text) {\n  // Models sometimes wrap JSON in prose or code fences: take the outermost {...} or [...].\n  if (typeof text !== 'string') return null;\n  const starts = [text.indexOf('{'), text.indexOf('[')].filter((i) => i >= 0);\n  if (!starts.length) return null;\n  const start = Math.min(...starts);\n  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));\n  if (end <= start) return null;\n  try { return JSON.parse(text.slice(start, end + 1)); } catch (e) { return null; }\n}\n// ---- end shared helpers ----\n\n// One request for all candidate papers: cheaper than one call per paper.\nconst papers = $input.all().map((i) => i.json);\nconst system = 'You triage research papers for a team working on robotics, AI agents and quantitative trading. ' +\n  'Be strict: most papers are not relevant. Reply with JSON only.';\nconst user = 'Rate each paper 0-10 for relevance and give a one-sentence reason a practitioner would care.\\n' +\n  'Return a JSON array of {\"id\": string, \"relevance\": number, \"why\": string}.\\n\\n' +\n  JSON.stringify(papers.map((p) => ({ id: p.id, title: p.title, abstract: p.summary })));\nreturn [{ json: { body: claudeRequest(system, user, { maxTokens: 2000 }), count: papers.length } }];\n"
+      },
+      "id": "bd5a76ea-0867-57e7-869c-53faf79a7e30",
+      "name": "Build ranking prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "1a39c0dd-3fb9-51ac-9710-abbad7959d7a",
+      "name": "Rank with Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Anthropic API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- shared helpers (inlined by the builder; n8n Code nodes cannot import files) ----\nfunction claudeRequest(system, user, { model = 'claude-haiku-4-5-20251001', maxTokens = 1024 } = {}) {\n  // Body for POST https://api.anthropic.com/v1/messages\n  return { model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };\n}\n\nfunction claudeText(response) {\n  // Concatenate the text blocks of a Messages API response.\n  const blocks = (response && response.content) || [];\n  return blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');\n}\n\nfunction extractJson(text) {\n  // Models sometimes wrap JSON in prose or code fences: take the outermost {...} or [...].\n  if (typeof text !== 'string') return null;\n  const starts = [text.indexOf('{'), text.indexOf('[')].filter((i) => i >= 0);\n  if (!starts.length) return null;\n  const start = Math.min(...starts);\n  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));\n  if (end <= start) return null;\n  try { return JSON.parse(text.slice(start, end + 1)); } catch (e) { return null; }\n}\n// ---- end shared helpers ----\n\n// Join Claude's ratings with the papers. If the reply is unusable, fall back to keyword scores\n// so the digest still goes out (and say so).\nconst MIN_RELEVANCE = 6;\nconst papers = $('Parse feed').all().map((i) => i.json);\nconst ratings = extractJson(claudeText($input.first().json));\nlet picked;\nlet note = '';\nif (Array.isArray(ratings)) {\n  const byId = Object.fromEntries(ratings.filter((r) => r && r.id).map((r) => [r.id, r]));\n  picked = papers\n    .filter((p) => byId[p.id] && Number(byId[p.id].relevance) >= MIN_RELEVANCE)\n    .map((p) => ({ ...p, relevance: Number(byId[p.id].relevance), why: String(byId[p.id].why || '') }))\n    .sort((a, b) => b.relevance - a.relevance);\n} else {\n  note = '_(ranking model unavailable: ordered by keyword match)_\\n';\n  picked = papers.filter((p) => p.keywordScore >= 2).slice(0, 5).map((p) => ({ ...p, relevance: null, why: '' }));\n}\nif (!picked.length) return [];\nconst lines = picked.map((p) => `• <${p.id}|${p.title}>${p.relevance !== null ? ` (${p.relevance}/10)` : ''}` +\n  `\\n   ${p.authors.join(', ')}${p.why ? `\\n   _${p.why}_` : ''}`);\nreturn [{ json: { text: `*Research digest: ${picked.length} paper(s)*\\n${note}${lines.join('\\n')}`, count: picked.length } }];\n"
+      },
+      "id": "2cf3f2ef-1cc5-540f-8acf-59d14248758d",
+      "name": "Format digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#research",
+          "mode": "name"
+        },
+        "text": "={{ $json.text }}",
+        "otherOptions": {}
+      },
+      "id": "6bb74bc6-fb19-59e1-8772-0c66ab72d9a8",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1800,
+        300
+      ],
+      "credentials": {
+        "slackApi": {
+          "name": "Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Setup\n1. Create a **Header Auth** credential named `Anthropic API key` (header name `x-api-key`, value = your key).\n2. Create a **Slack** credential and pick the channel.\n3. Edit `TOPICS` in *Parse feed*.\n\nPapers already sent are remembered (workflow static data), so nothing is posted twice. If Claude's reply is unusable, the digest falls back to keyword ranking and says so.",
+        "height": 260,
+        "width": 380
+      },
+      "id": "ea7790c7-3580-5426-b6f5-4651a4221820",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Weekdays 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch arXiv",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch arXiv": {
+      "main": [
+        [
+          {
+            "node": "Parse feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse feed": {
+      "main": [
+        [
+          {
+            "node": "Build ranking prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build ranking prompt": {
+      "main": [
+        [
+          {
+            "node": "Rank with Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank with Claude": {
+      "main": [
+        [
+          {
+            "node": "Format digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format digest": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Weekday digest of new robotics / AI-agent / quant papers, ranked for relevance by Claude."
+  },
+  "tags": []
+}

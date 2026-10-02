@@ -1,0 +1,164 @@
+{
+  "name": "Market move alert (EWMA z-score)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "007d015d-2734-5064-bd63-e61b7bc737b8",
+      "name": "Every 15 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Edit here: what to watch and how sensitive the alert is.\n// PRICE_URL must return JSON like {\"symbol\": \"XAUUSD\", \"price\": 2345.6, \"ts\": \"2026-10-02T12:00:00Z\"}.\nconst PRICE_URL = 'https://your-data-provider.example.com/v1/quote?symbol=';\nconst SYMBOLS = ['XAUUSD', 'EURUSD', 'US500'];\nreturn SYMBOLS.map((symbol) => ({ json: { symbol, url: PRICE_URL + encodeURIComponent(symbol) } }));\n"
+      },
+      "id": "d448d6b4-9808-55d5-b416-c36a324dd72d",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "id": "a2d6a98e-855f-5908-af6d-9caae9ec50be",
+      "name": "Fetch price",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Alert when the latest return is unusual relative to recent volatility (EWMA z-score),\n// with a cooldown so one move does not page people every 15 minutes.\nconst Z_THRESHOLD = 3.0;\nconst LAMBDA = 0.94;          // EWMA decay (RiskMetrics-style)\nconst MIN_HISTORY = 20;       // returns needed before alerting\nconst COOLDOWN_MIN = 120;\n\nconst state = $getWorkflowStaticData('global');\nstate.series = state.series || {};\nconst alerts = [];\nfor (const item of $input.all()) {\n  const { symbol, price, ts } = item.json;\n  if (!symbol || !(price > 0)) continue;           // bad tick: ignore, never alert on it\n  const s = state.series[symbol] || { last: null, var: null, n: 0, lastAlert: 0 };\n  if (s.last !== null) {\n    const r = Math.log(price / s.last);\n    if (s.var !== null && s.n >= MIN_HISTORY) {\n      const z = r / Math.sqrt(s.var);\n      const now = Date.parse(ts) || Date.now();\n      if (Math.abs(z) >= Z_THRESHOLD && now - s.lastAlert >= COOLDOWN_MIN * 60e3) {\n        alerts.push({ symbol, price, ts, returnPct: +(100 * r).toFixed(3), z: +z.toFixed(2) });\n        s.lastAlert = now;\n      }\n    }\n    s.var = s.var === null ? r * r : LAMBDA * s.var + (1 - LAMBDA) * r * r;  // update after testing\n    s.n += 1;\n  }\n  s.last = price;\n  state.series[symbol] = s;\n}\nreturn alerts.map((a) => ({\n  json: { ...a, text: `:rotating_light: *${a.symbol}* moved ${a.returnPct > 0 ? '+' : ''}${a.returnPct}% ` +\n    `(${a.z}σ vs recent volatility) to ${a.price} at ${a.ts}` },\n}));\n"
+      },
+      "id": "b3f1eb0d-7eb7-5e2f-8950-f72170f05de3",
+      "name": "Detect unusual moves",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#trading-alerts",
+          "mode": "name"
+        },
+        "text": "={{ $json.text }}",
+        "otherOptions": {}
+      },
+      "id": "fcbffff1-8286-53cc-9e48-9cedd4a10f81",
+      "name": "Alert #trading",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1280,
+        300
+      ],
+      "credentials": {
+        "slackApi": {
+          "name": "Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Setup\n1. In *Config*, set `PRICE_URL` to your data source and the `SYMBOLS`.\n2. Create a **Slack** credential.\n\nVolatility is an EWMA (λ = 0.94); a move must exceed 3σ, and each symbol has a 2-hour cooldown. Bad ticks are ignored. Information only, not trading advice.",
+        "height": 260,
+        "width": 380
+      },
+      "id": "4cd0f32e-98d4-5c0b-b81e-45c7053ceb03",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Every 15 min": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch price",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch price": {
+      "main": [
+        [
+          {
+            "node": "Detect unusual moves",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect unusual moves": {
+      "main": [
+        [
+          {
+            "node": "Alert #trading",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Every 15 minutes: alert on returns that are unusual relative to recent volatility, with a cooldown."
+  },
+  "tags": []
+}

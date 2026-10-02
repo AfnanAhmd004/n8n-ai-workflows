@@ -1,0 +1,244 @@
+{
+  "name": "Weekly fleet KPI report (with grounded LLM summary)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "fda38835-7d1d-5052-96ef-01b887eae931",
+      "name": "Mondays 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://fleet.example.com/api/events",
+        "options": {},
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "since",
+              "value": "7d"
+            }
+          ]
+        }
+      },
+      "id": "4652154c-14cc-5baa-bc80-d627dbe9dc62",
+      "name": "Fetch fleet events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Weekly fleet KPIs from fault events. Events: {robot_id, start, end} downtime intervals plus {code}.\nconst WEEK_H = 7 * 24;\nconst events = $input.first().json.events || [];\nconst robots = $input.first().json.robots || [...new Set(events.map((e) => e.robot_id))];\nconst down = {};\nconst codes = {};\nfor (const e of events) {\n  const h = Math.max(0, (Date.parse(e.end) - Date.parse(e.start)) / 36e5);\n  down[e.robot_id] = (down[e.robot_id] || 0) + h;\n  codes[e.code] = (codes[e.code] || 0) + 1;\n}\nconst totalDown = Object.values(down).reduce((a, b) => a + b, 0);\nconst fleetHours = robots.length * WEEK_H;\nconst kpis = {\n  robots: robots.length,\n  failures: events.length,\n  availability_pct: +(100 * (1 - totalDown / fleetHours)).toFixed(1),\n  mtbf_h: events.length ? +((fleetHours - totalDown) / events.length).toFixed(1) : null,\n  mttr_h: events.length ? +(totalDown / events.length).toFixed(1) : null,\n  top_codes: Object.entries(codes).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([code, n]) => ({ code, n })),\n  worst_robot: Object.entries(down).sort((a, b) => b[1] - a[1]).map(([id, h]) => ({ id, down_h: +h.toFixed(1) }))[0] || null,\n};\nconst state = $getWorkflowStaticData('global');\nconst previous = state.lastWeek || null;\nstate.lastWeek = kpis;\nreturn [{ json: { kpis, previous } }];\n"
+      },
+      "id": "81b38aae-5ee4-55c1-bf8a-74b21a334dba",
+      "name": "Compute KPIs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- shared helpers (inlined by the builder; n8n Code nodes cannot import files) ----\nfunction claudeRequest(system, user, { model = 'claude-haiku-4-5-20251001', maxTokens = 1024 } = {}) {\n  // Body for POST https://api.anthropic.com/v1/messages\n  return { model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };\n}\n\nfunction claudeText(response) {\n  // Concatenate the text blocks of a Messages API response.\n  const blocks = (response && response.content) || [];\n  return blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');\n}\n\nfunction extractJson(text) {\n  // Models sometimes wrap JSON in prose or code fences: take the outermost {...} or [...].\n  if (typeof text !== 'string') return null;\n  const starts = [text.indexOf('{'), text.indexOf('[')].filter((i) => i >= 0);\n  if (!starts.length) return null;\n  const start = Math.min(...starts);\n  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));\n  if (end <= start) return null;\n  try { return JSON.parse(text.slice(start, end + 1)); } catch (e) { return null; }\n}\n// ---- end shared helpers ----\n\nconst { kpis, previous } = $input.first().json;\nconst system = 'You write a weekly operations summary for company leadership. Use ONLY the numbers provided; ' +\n  'do not compute new ones. Five bullets maximum, plain language, end with one recommended action.';\nconst user = `This week: ${JSON.stringify(kpis)}\\nLast week: ${JSON.stringify(previous)}`;\nreturn [{ json: { body: claudeRequest(system, user, { maxTokens: 500 }) } }];\n"
+      },
+      "id": "934d917e-f196-59e1-b9f9-e9fea2551741",
+      "name": "Build summary prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "af325063-9618-57da-8bd1-ba7a6a3f1d88",
+      "name": "Summarise with Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Anthropic API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- shared helpers (inlined by the builder; n8n Code nodes cannot import files) ----\nfunction claudeRequest(system, user, { model = 'claude-haiku-4-5-20251001', maxTokens = 1024 } = {}) {\n  // Body for POST https://api.anthropic.com/v1/messages\n  return { model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };\n}\n\nfunction claudeText(response) {\n  // Concatenate the text blocks of a Messages API response.\n  const blocks = (response && response.content) || [];\n  return blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');\n}\n\nfunction extractJson(text) {\n  // Models sometimes wrap JSON in prose or code fences: take the outermost {...} or [...].\n  if (typeof text !== 'string') return null;\n  const starts = [text.indexOf('{'), text.indexOf('[')].filter((i) => i >= 0);\n  if (!starts.length) return null;\n  const start = Math.min(...starts);\n  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));\n  if (end <= start) return null;\n  try { return JSON.parse(text.slice(start, end + 1)); } catch (e) { return null; }\n}\n// ---- end shared helpers ----\n\n// Anti-hallucination check: every number in the narrative must appear in the KPI data;\n// otherwise the email uses a plain template instead of the model's text.\nconst { kpis, previous } = $('Compute KPIs').first().json;\nconst narrative = claudeText($input.first().json).trim();\nconst allowed = new Set();\nconst collect = (v) => {\n  if (v === null || v === undefined) return;\n  if (typeof v === 'number') { allowed.add(String(v)); allowed.add(String(Math.round(v))); return; }\n  if (typeof v === 'string') { (v.match(/\\d+(\\.\\d+)?/g) || []).forEach((n) => allowed.add(n)); return; }\n  Object.values(v).forEach(collect);\n};\ncollect(kpis);\ncollect(previous);\nconst numbers = narrative.match(/\\d+(\\.\\d+)?/g) || [];\nconst unsupported = numbers.filter((n) => !allowed.has(n));\nconst grounded = narrative.length > 0 && unsupported.length === 0;\nconst fallback = `Availability ${kpis.availability_pct}% across ${kpis.robots} robots, ${kpis.failures} failures, ` +\n  `MTBF ${kpis.mtbf_h} h, MTTR ${kpis.mttr_h} h.`;\nconst rows = [['Availability', `${kpis.availability_pct}%`, previous ? `${previous.availability_pct}%` : '-'],\n  ['Failures', kpis.failures, previous ? previous.failures : '-'],\n  ['MTBF (h)', kpis.mtbf_h, previous ? previous.mtbf_h : '-'],\n  ['MTTR (h)', kpis.mttr_h, previous ? previous.mttr_h : '-']];\nconst table = '<table border=\"1\" cellpadding=\"4\"><tr><th>KPI</th><th>This week</th><th>Last week</th></tr>' +\n  rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`).join('') + '</table>';\nconst body = `<p>${(grounded ? narrative : fallback).replace(/\\n/g, '<br>')}</p>${table}` +\n  (grounded ? '' : `<p><small>Model summary withheld: unsupported numbers ${unsupported.join(', ') || '(empty reply)'}.</small></p>`);\nreturn [{ json: { subject: `Fleet weekly: availability ${kpis.availability_pct}%`, html: body, grounded, unsupported } }];\n"
+      },
+      "id": "35b9dea8-2ecf-55e3-8cbb-261088199489",
+      "name": "Grounding check & email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "fleet-reports@example.com",
+        "toEmail": "leadership@example.com",
+        "subject": "={{ $json.subject }}",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "id": "6b170ee9-75a9-56a1-b14b-03d47824d2e7",
+      "name": "Send email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1800,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "name": "SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Setup\n1. Create a **Header Auth** credential named `Anthropic API key` (header name `x-api-key`, value = your key).\n2. Point *Fetch fleet events* at your fleet API; it should return `{robots: [...], events: [{robot_id, code, start, end}]}`.\n3. **SMTP** credential and recipients.\n\nEvery number in the model's summary must exist in the KPI data or the email falls back to a template.",
+        "height": 260,
+        "width": 380
+      },
+      "id": "05f38033-50aa-5cc3-b9cd-b3ff53aac405",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Mondays 08:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch fleet events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch fleet events": {
+      "main": [
+        [
+          {
+            "node": "Compute KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute KPIs": {
+      "main": [
+        [
+          {
+            "node": "Build summary prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build summary prompt": {
+      "main": [
+        [
+          {
+            "node": "Summarise with Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise with Claude": {
+      "main": [
+        [
+          {
+            "node": "Grounding check & email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grounding check & email": {
+      "main": [
+        [
+          {
+            "node": "Send email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Monday report: availability, MTBF, MTTR and top faults; the LLM summary is rejected if it contains any number not in the data."
+  },
+  "tags": []
+}
